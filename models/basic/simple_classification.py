@@ -4,7 +4,6 @@ from sklearn.datasets import load_iris
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import torch.optim as optim
-import torch.nn.functional as F
 
 class ClassificationMLP(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
