@@ -284,14 +284,23 @@ class PPO:
             next_obs = torch.from_numpy(next_obs).float()
             next_done = torch.from_numpy(done).float()
             
-            # Track episode statistics
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        self.episode_rewards.append(info["episode"]["r"])
-                        self.episode_lengths.append(info["episode"]["l"])
-                        self.writer.add_scalar("charts/episodic_return", info["episode"]["r"], self.global_step)
-                        self.writer.add_scalar("charts/episodic_length", info["episode"]["l"], self.global_step)
+            # Track episode statistics - this is the critical part
+            for idx, info in enumerate(infos):
+                if "episode" in info:
+                    ep_reward = info["episode"]["r"]
+                    ep_length = info["episode"]["l"]
+                    self.episode_rewards.append(ep_reward)
+                    self.episode_lengths.append(ep_length)
+                    self.writer.add_scalar("charts/episodic_return", ep_reward, self.global_step)
+                    self.writer.add_scalar("charts/episodic_length", ep_length, self.global_step)
+                    
+                    # Debug logging
+                    if len(self.episode_rewards) % 100 == 0:
+                        recent_rewards = self.episode_rewards[-100:]
+                        perfect_count = sum(1 for r in recent_rewards if r >= 499)
+                        print(f"[DEBUG] Episodes: {len(self.episode_rewards)}, "
+                              f"Recent 100 avg: {np.mean(recent_rewards):.1f}, "
+                              f"Perfect scores: {perfect_count}/100")
                         
         return next_obs, next_done
     
@@ -507,9 +516,11 @@ class PPO:
     
     def train(self) -> List[float]:
         """Main training loop"""
-        print(f"Training PPO on {self.config.env_name}")
+        print(f"Starting PPO training with config:")
+        print(f"  Total steps: {self.config.total_timesteps}")
+        print(f"  Updates: {self.num_updates}")
+        print(f"  Minibatch updates per epoch: {self.config.n_steps * self.config.num_envs // self.config.batch_size}")
         print(f"Device: {self.config.device}")
-        print(f"Total timesteps: {self.config.total_timesteps}")
         print(f"Number of environments: {self.config.num_envs}")
         
         # Initialize
@@ -539,6 +550,30 @@ class PPO:
                     recent_rewards = self.episode_rewards[-100:]
                     print(f"  Avg Return (last 100 eps): {np.mean(recent_rewards):.2f} ± {np.std(recent_rewards):.2f}")
             
+            # Quick evaluation to verify training performance
+            if update % 50 == 0:
+                print("\n[Quick Eval] Testing current policy...")
+                quick_test_rewards = []
+                for _ in range(10):
+                    test_obs, _ = self.envs.reset()
+                    test_obs = torch.from_numpy(test_obs).float()
+                    done = False
+                    total_reward = np.zeros(self.config.num_envs)
+                    
+                    while not done:
+                        with torch.no_grad():
+                            norm_test_obs = test_obs.to(self.config.device)
+                            action, _, _, _ = self.agent.get_action_and_value(norm_test_obs)
+                            test_obs, reward, term, trunc, _ = self.envs.step(action.cpu().numpy())
+                            test_obs = torch.from_numpy(test_obs).float()
+                            total_reward += reward
+                            done = np.any(np.logical_or(term, trunc))
+                    
+                    quick_test_rewards.extend(total_reward)
+                
+                print(f"[Quick Eval] Mean: {np.mean(quick_test_rewards):.1f} ± {np.std(quick_test_rewards):.1f}")
+                print(f"[Quick Eval] Perfect scores: {sum(1 for r in quick_test_rewards if r >= 499)}/{len(quick_test_rewards)}\n")
+            
             # Evaluation
             if self.config.eval_freq > 0 and self.global_step % self.config.eval_freq == 0:
                 eval_rewards = self.evaluate(self.config.eval_episodes)
@@ -557,7 +592,7 @@ class PPO:
         self.writer.close()
         return self.episode_rewards
     
-    def test(self, n_episodes: int = 10) -> List[float]:
+    def test(self, n_episodes: int = 10, deterministic: bool = True) -> List[float]:
         """Test the trained policy"""
         test_env = gym.make(self.config.env_name, render_mode="human")
         test_rewards = []
@@ -576,8 +611,17 @@ class PPO:
                         obs_tensor = torch.FloatTensor(norm_obs).unsqueeze(0).to(self.config.device)
                     else:
                         obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.config.device)
-                        
-                    action, _, _, _ = self.agent.get_action_and_value(obs_tensor)
+                    
+                    if deterministic and not self.is_continuous:
+                        # For discrete actions, take argmax during testing
+                        logits = self.agent.actor(obs_tensor)
+                        action = torch.argmax(logits, dim=1)
+                    elif deterministic and self.is_continuous:
+                        # For continuous actions, use mean
+                        action = self.agent.actor_mean(obs_tensor)
+                    else:
+                        # Sample from distribution (same as training)
+                        action, _, _, _ = self.agent.get_action_and_value(obs_tensor)
                     
                     if self.is_continuous:
                         action = action.cpu().numpy()[0]
@@ -606,27 +650,27 @@ def main():
     # Example configurations for different environments
     
     # CartPole-v1 - Fast convergence config
-    config = PPOConfig(
-        env_name="CartPole-v1",
-        total_timesteps=50000,   # Should be enough for CartPole
-        learning_rate=3e-4,      # Standard LR for simple tasks
-        n_steps=32,              # Very short rollouts for fast updates
-        batch_size=32,           # Full batch updates
-        n_epochs=10,             # Thorough optimization per update
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_coef=0.2,
-        ent_coef=0.0,            # No entropy needed for CartPole
-        vf_coef=1.0,             # Strong value function fitting
-        max_grad_norm=0.5,
-        num_envs=8,
-        normalize_observations=False,
-        normalize_rewards=False,
-        eval_freq=10000,
-        target_kl=None,
-        lr_schedule=False,       # No decay needed for short training
-        seed=42
-    )
+    # config = PPOConfig(
+    #     env_name="CartPole-v1",
+    #     total_timesteps=50000,   # Should be enough for CartPole
+    #     learning_rate=3e-4,      # Standard LR for simple tasks
+    #     n_steps=32,              # Very short rollouts for fast updates
+    #     batch_size=32,           # Full batch updates
+    #     n_epochs=10,             # Thorough optimization per update
+    #     gamma=0.99,
+    #     gae_lambda=0.95,
+    #     clip_coef=0.2,
+    #     ent_coef=0.00,            # No entropy needed for CartPole
+    #     vf_coef=1.0,             # Strong value function fitting
+    #     max_grad_norm=0.5,
+    #     num_envs=4,
+    #     normalize_observations=True,
+    #     normalize_rewards=True,
+    #     eval_freq=10000,
+    #     target_kl=0.02,
+    #     lr_schedule=False,       # No decay needed for short training
+    #     seed=42
+    # )
     
     # # Alternative: Stable but slightly slower
     # config = PPOConfig(
@@ -650,24 +694,24 @@ def main():
     # )
     
     # # Pendulum-v1 (Continuous)
-    # config = PPOConfig(
-    #     env_name="Pendulum-v1",
-    #     total_timesteps=200000,
-    #     learning_rate=3e-4,
-    #     n_steps=2048,
-    #     batch_size=64,
-    #     n_epochs=10,
-    #     gamma=0.99,
-    #     gae_lambda=0.95,
-    #     clip_coef=0.2,
-    #     ent_coef=0.0,
-    #     vf_coef=0.5,
-    #     max_grad_norm=0.5,
-    #     num_envs=4,
-    #     normalize_observations=True,
-    #     normalize_rewards=False,
-    #     seed=42
-    # )
+    config = PPOConfig(
+        env_name="Pendulum-v1",
+        total_timesteps=200000,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_coef=0.2,
+        ent_coef=0.0,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        num_envs=4,
+        normalize_observations=True,
+        normalize_rewards=False,
+        seed=42
+    )
     
     # # LunarLander-v2 (Discrete)
     # config = PPOConfig(
@@ -701,39 +745,56 @@ def main():
     
     # Test the trained agent
     print("\nRunning final evaluation...")
-    test_rewards = ppo.test(n_episodes=30)  # More episodes for reliable statistics
+    test_rewards = ppo.test(n_episodes=30, deterministic=True)  # Deterministic testing
+    
+    # Also test with stochastic policy to match training
+    print("\nRunning stochastic evaluation (matching training behavior)...")
+    stochastic_rewards = ppo.test(n_episodes=30, deterministic=False)
     
     print(f"\nTraining completed!")
     if episode_rewards:
-        # Check when solved (avg >= 195 for 100 episodes)
+        # Check when solved (avg >= 195 for 100 consecutive episodes)
         solved_at = None
-        for i in range(100, len(episode_rewards)):
-            if np.mean(episode_rewards[i-100:i]) >= 195:
-                solved_at = i
-                break
+        if len(episode_rewards) >= 100:
+            for i in range(100, len(episode_rewards) + 1):
+                if np.mean(episode_rewards[i-100:i]) >= 195:
+                    solved_at = i
+                    break
                 
         final_100_mean = np.mean(episode_rewards[-100:])
         final_100_std = np.std(episode_rewards[-100:])
         print(f"Final 100 training episodes: {final_100_mean:.2f} ± {final_100_std:.2f}")
         
         if solved_at:
-            print(f"Environment solved at episode {solved_at} (~{solved_at * config.num_envs} steps)")
+            # Calculate actual environment steps when solved
+            episodes_per_env = solved_at / config.num_envs
+            steps_when_solved = episodes_per_env * config.num_envs * np.mean([len(e) for e in episode_rewards[:solved_at] if e > 0])
+            print(f"Environment solved at episode {solved_at} (approx. step {int(steps_when_solved)})")
         
         # Check consistency
         perfect_scores = sum(1 for r in episode_rewards[-100:] if r >= 499)
         print(f"Perfect scores (≥499) in last 100 episodes: {perfect_scores}%")
     
     # Detailed test analysis
+    print(f"\nDeterministic Test Performance:")
     perfect_test_scores = sum(1 for r in test_rewards if r >= 499)
-    print(f"\nTest Performance Analysis:")
     print(f"Perfect scores (≥499): {perfect_test_scores}/{len(test_rewards)} ({100*perfect_test_scores/len(test_rewards):.1f}%)")
-    print(f"Test variance: {np.std(test_rewards):.2f}")
-    print(f"Consistency: {'EXCELLENT' if np.std(test_rewards) < 20 else 'GOOD' if np.std(test_rewards) < 100 else 'POOR'}")
+    print(f"Mean: {np.mean(test_rewards):.2f} ± {np.std(test_rewards):.2f}")
+    
+    print(f"\nStochastic Test Performance (matches training):")
+    perfect_stochastic = sum(1 for r in stochastic_rewards if r >= 499)
+    print(f"Perfect scores (≥499): {perfect_stochastic}/{len(stochastic_rewards)} ({100*perfect_stochastic/len(stochastic_rewards):.1f}%)")
+    print(f"Mean: {np.mean(stochastic_rewards):.2f} ± {np.std(stochastic_rewards):.2f}")
     
     # Expected performance benchmarks
     print(f"\nPerformance vs Expected:")
     print(f"Expected: Solve (<50k steps), >95% perfect scores")
-    print(f"Actual: {config.total_timesteps} steps, {100*perfect_test_scores/len(test_rewards):.1f}% perfect scores")
+    print(f"Actual: {config.total_timesteps} steps, {100*perfect_stochastic/len(stochastic_rewards):.1f}% perfect scores (stochastic)")
+    
+    # This is the real metric that matters
+    if np.mean(stochastic_rewards) < 450:
+        print("\n⚠️  WARNING: Agent performs well with deterministic actions but poorly with stochastic policy.")
+        print("This suggests the policy hasn't properly converged - it's relying on argmax to hide poor exploration.")
         
     # Plot learning curve if matplotlib is available
     try:

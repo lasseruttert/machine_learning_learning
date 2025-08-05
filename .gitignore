@@ -1,3 +1,5 @@
 models/basic/tempCodeRunnerFile.py
 data
 *.pth
+runs
+simple_rag/chroma_langchain_db
